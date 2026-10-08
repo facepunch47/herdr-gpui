@@ -17,7 +17,7 @@ use super::error::{Result, UpdateError as Error};
 use super::release;
 use std::{
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     io::{BufRead, BufReader},
     os::unix::fs::MetadataExt,
@@ -360,62 +360,95 @@ pub(super) fn upgrade(
 /// that process is alive starts a second instance, and macOS puts it in
 /// Recents instead of reusing the pin. The outer shell double-forks and exits
 /// so the waiter is no longer a child of the GUI. Quitting then cannot take
-/// the waiter with it. A poll budget stops the waiter from launching a second
-/// copy when this process never exits.
+/// the waiter with it.
+///
+/// By the time `open` runs nothing is left to show an error, so every outcome
+/// goes to the system log and a failure raises an alert. The alert text is a
+/// fixed argument, never interpolated into AppleScript. A wall-clock deadline
+/// stops the waiter when this process never exits: it then tells the user to
+/// restart by hand rather than open a copy that would only activate this one.
 const RELAUNCH_SCRIPT: &str = r#"
 trap '' HUP
 pid=$1
 bundle=$2
-opener=$3
+id=$3
 limit=$4
-ready=$5
-settled=$6
 (
   trap '' HUP
-  if [ -n "$ready" ]; then
-    : > "$ready" || exit 1
-  fi
-  i=0
+  report() { logger -t herdr-gpui -- "relaunch: $1"; }
+  alert() {
+    osascript -e 'on run argv' \
+      -e 'display alert (item 1 of argv) giving up after 300' \
+      -e 'end run' "$1"
+  }
+  report "waiting for $pid to exit"
+  deadline=$(($(date +%s) + limit))
   while kill -0 "$pid" 2>/dev/null; do
-    i=$((i + 1))
-    if [ "$i" -gt "$limit" ]; then
-      if [ -n "$settled" ]; then
-        printf 'gave-up\n' > "$settled" || exit 1
-      fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      report "gave up: $pid did not exit"
+      alert "Herdr did not quit in time to restart. Quit Herdr, then open it again to finish the update."
       exit 0
     fi
-    /bin/sleep 0.05 || exit 1
+    sleep 0.05
   done
   # The process is gone. Give Dock a moment to release the pin.
-  /bin/sleep 0.2 || exit 1
-  if [ -n "$settled" ]; then
-    printf 'open\n' > "$settled" || exit 1
+  sleep 0.2
+  # A plain open would only activate another instance with this bundle ID,
+  # so the upgraded build starts beside it instead, giving up the pin.
+  fresh=
+  if [ -n "$(lsappinfo find "bundleid=$id" 2>/dev/null)" ]; then
+    fresh=-n
   fi
-  exec "$opener" -- "$bundle"
+  # LaunchServices can briefly refuse a bundle that was just replaced.
+  for attempt in 1 2 3; do
+    if open $fresh -- "$bundle"; then
+      report "opened${fresh:+ $fresh}"
+      exit 0
+    fi
+    sleep 1
+  done
+  report "open failed"
+  alert "Herdr was updated but could not restart. Open Herdr from Applications."
+  exit 1
 ) >/dev/null 2>&1 &
 exit 0
 "#;
 
+/// The bundle executable, as named by `CFBundleExecutable` in Info.plist.
+const EXECUTABLE: &str = "Contents/MacOS/Herdr";
+
 /// Arm a detached `open` of the upgraded bundle. The caller quits afterwards.
 pub(super) fn relaunch(cask: &Cask) -> Result<()> {
-    let polls = u32::try_from(RELAUNCH.as_millis() / 50).unwrap_or(600);
+    runnable(&cask.bundle)?;
     schedule_relaunch(
         std::process::id(),
         &cask.bundle,
-        Path::new("/usr/bin/open"),
-        polls,
-        None,
-        None,
+        crate::constants::APP_ID,
+        "/usr/bin:/bin",
+        RELAUNCH,
     )
 }
 
+/// Fail while this instance can still say so: once it quits, a missing app
+/// would leave the user with nothing running.
+fn runnable(bundle: &Path) -> Result<()> {
+    let executable = bundle.join(EXECUTABLE);
+    let ready =
+        fs::metadata(&executable).is_ok_and(|meta| meta.is_file() && meta.mode() & 0o111 != 0);
+    if ready {
+        Ok(())
+    } else {
+        Err(Error::RelaunchMissing(executable))
+    }
+}
+
+/// `search_path` is the waiter's whole `PATH`; tests put stand-ins first.
 fn schedule_relaunch(
     pid: u32,
     bundle: &Path,
-    opener: &Path,
-    polls: u32,
-    ready: Option<&Path>,
-    settled: Option<&Path>,
+    bundle_id: &str,
+    search_path: impl AsRef<OsStr>,
+    limit: Duration,
 ) -> Result<()> {
     let mut command = Command::new("/bin/sh");
     command
@@ -424,12 +457,10 @@ fn schedule_relaunch(
         .arg("herdr-relaunch")
         .arg(pid.to_string())
         .arg(bundle)
-        .arg(opener)
-        .arg(polls.to_string())
-        .arg(ready.unwrap_or(Path::new("")))
-        .arg(settled.unwrap_or(Path::new("")))
+        .arg(bundle_id)
+        .arg(limit.as_secs().to_string())
         .env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", search_path)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
