@@ -330,9 +330,10 @@ leave no installed app at all. The sequence shares one 30-minute command budget,
 plus bounded output-draining time.
 
 Homebrew trashes the running bundle as it upgrades, so bundle resources can be
-gone until restart. Restart is offered as soon as the upgrade lands, after
-checking that the upgraded bundle has a runnable executable. A detached helper
-waits until this instance has quit, then runs `open` on the upgraded bundle
+gone until restart. Restart is offered as soon as the upgrade lands. When
+restart is requested, the upgraded bundle is checked for a runnable executable
+before this instance quits. A detached helper waits until this instance has
+quit, then runs `open` on the upgraded bundle
 with no `-n`, so macOS reuses the pinned Dock tile instead of placing a second
 icon in Recents. If another Herdr instance is still running, the helper uses
 `open -n` so the upgraded build starts instead of activating that instance.
