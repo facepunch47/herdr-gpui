@@ -330,9 +330,10 @@ leave no installed app at all. The sequence shares one 30-minute command budget,
 plus bounded output-draining time.
 
 Homebrew trashes the running bundle as it upgrades, so bundle resources can be
-gone until restart. Restart is offered as soon as the upgrade lands and launches
-the upgraded bundle with `open -n` before this instance quits. The daemon and its
-terminals are untouched.
+gone until restart. Restart is offered as soon as the upgrade lands. A detached
+helper waits until this instance has quit, then runs `open` on the upgraded
+bundle with no `-n`, so macOS reuses the pinned Dock tile instead of placing a
+second icon in Recents. The daemon and its terminals are untouched.
 
 For an explicitly approved real upgrade, use
 `just test-brew-upgrade /absolute/path/to/Herdr.app YYYYMMDD.COUNTER`, supplying

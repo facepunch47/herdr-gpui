@@ -21,6 +21,7 @@ use std::{
     fs,
     io::{BufRead, BufReader},
     os::unix::fs::MetadataExt,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -353,17 +354,94 @@ pub(super) fn upgrade(
     }
 }
 
-/// Start the upgraded app, leaving the caller to quit once it is up. `open -n`
-/// launches the new bundle rather than activating this still-running instance.
+/// Wait until `pid` has exited, then `open` the bundle with no `-n`.
+///
+/// The pinned Dock tile stays bound to the running instance. `open -n` while
+/// that process is alive starts a second instance, and macOS puts it in
+/// Recents instead of reusing the pin. The outer shell double-forks and exits
+/// so the waiter is no longer a child of the GUI. Quitting then cannot take
+/// the waiter with it. A poll budget stops the waiter from launching a second
+/// copy when this process never exits.
+const RELAUNCH_SCRIPT: &str = r#"
+trap '' HUP
+pid=$1
+bundle=$2
+opener=$3
+limit=$4
+ready=$5
+settled=$6
+(
+  trap '' HUP
+  if [ -n "$ready" ]; then
+    : > "$ready" || exit 1
+  fi
+  i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    i=$((i + 1))
+    if [ "$i" -gt "$limit" ]; then
+      if [ -n "$settled" ]; then
+        printf 'gave-up\n' > "$settled" || exit 1
+      fi
+      exit 0
+    fi
+    /bin/sleep 0.05 || exit 1
+  done
+  # The process is gone. Give Dock a moment to release the pin.
+  /bin/sleep 0.2 || exit 1
+  if [ -n "$settled" ]; then
+    printf 'open\n' > "$settled" || exit 1
+  fi
+  exec "$opener" -- "$bundle"
+) >/dev/null 2>&1 &
+exit 0
+"#;
+
+/// Arm a detached `open` of the upgraded bundle. The caller quits afterwards.
 pub(super) fn relaunch(cask: &Cask) -> Result<()> {
-    let mut command = Command::new("/usr/bin/open");
+    let polls = u32::try_from(RELAUNCH.as_millis() / 50).unwrap_or(600);
+    schedule_relaunch(
+        std::process::id(),
+        &cask.bundle,
+        Path::new("/usr/bin/open"),
+        polls,
+        None,
+        None,
+    )
+}
+
+fn schedule_relaunch(
+    pid: u32,
+    bundle: &Path,
+    opener: &Path,
+    polls: u32,
+    ready: Option<&Path>,
+    settled: Option<&Path>,
+) -> Result<()> {
+    let mut command = Command::new("/bin/sh");
     command
+        .arg("-c")
+        .arg(RELAUNCH_SCRIPT)
+        .arg("herdr-relaunch")
+        .arg(pid.to_string())
+        .arg(bundle)
+        .arg(opener)
+        .arg(polls.to_string())
+        .arg(ready.unwrap_or(Path::new("")))
+        .arg(settled.unwrap_or(Path::new("")))
         .env_clear()
+        .env("PATH", "/usr/bin:/bin")
         .env("LC_ALL", "C")
-        .arg("-n")
-        .arg(&cask.bundle)
-        .stdin(Stdio::null());
-    run(command, RELAUNCH, None, |_| ()).map(|_| ())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut child = command.spawn().map_err(Error::Io)?;
+    let status = child.wait().map_err(Error::Io)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::RelaunchFailed(status))
+    }
 }
 
 #[cfg(test)]
